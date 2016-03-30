@@ -1,0 +1,2 @@
+-e git+https://github.com/saghul/aiouv.git@76e21166055487aa699bc2ef31cb2639e92cbc92#egg=aiouv
+ipython==4.1.2
