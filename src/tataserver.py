@@ -19,8 +19,8 @@ import concurrent.futures
 from random import randrange, choice, randint
 import logging
 
-Action = Enum('Action', 'recognize move file terminate')
-Direction = Enum('Direction', 'north west south east')
+Action = Enum('Action', 'recognize move fire terminate', start=0)
+Direction = Enum('Direction', 'north west south east', start=0)
 STEP_DELTA = {
 		Direction.north: (0, 1),
 	Direction.west: (-1, 0), Direction.east: (1, 0),
@@ -31,8 +31,9 @@ Player = namedtuple('Player', 'id color x y direction')
 
 
 class Client:
-	joined_template = 'joined %(player.color)s %(player.x)d %(player.y)d %(player.direction)d\n'
-	id_template = 'id %(player.id)d\n'
+	joined_template = 'joined {player.id:d} {player.color:s} {player.x:d} {player.y:d} {player.direction.value:d}\n'
+	id_template = 'id {player.id:d}\n'
+	position_template = 'position {player.id:d} {player.x:d} {player.y:d} {player.direction.value:d}\n'
 
 	def __init__(self, name, id, intentions, reader, writer):
 		self.pong = name.encode('utf-8') + b'\n'
@@ -48,6 +49,10 @@ class Client:
 		while not self.stopped:
 			try:
 				command = (await self.reader.readline()).decode('utf-8')
+				if not command:
+					if self.reader.at_eof():
+						raise EOFError
+					continue
 			except Exception as e:
 				self.intentions.put_nowait(Intention(self.id, Action.terminate, e))
 				break
@@ -64,7 +69,8 @@ class Client:
 				self.intentions.put_nowait(Intention(self.id, Action.recognize, color))
 			elif name == 'move':
 				direction, *_ = values
-				self.intentions.put_nowait(Intention(self.id, Action.move, Direction(int(direction, 10))))
+				direction = int(direction, 10)
+				self.intentions.put_nowait(Intention(self.id, Action.move, Direction(direction)))
 			elif name == 'fire':
 				self.intentions.put_nowait(Intention(self.id, Action.fire, None))
 
@@ -117,23 +123,31 @@ class Battle:
 
 			for intention in moved:
 				id = intention.id
+				direction = intention.value
 				player = self.players[id]
-				delta = STEP_DELTA[intention.direction]
+				delta = STEP_DELTA[direction]
+				client = self.clients[id]
+
 				x = player.x + delta[0]
-				if x < 0 or x > self.width:
+				if x < 0 or x >= self.width:
+					message = (Client.position_template.format(player=player)).encode('utf-8')
+					client.writer.write(message)
 					continue
 				y = player.y + delta[1]
-				if y < 0 or y > self.height:
+				if y < 0 or y >= self.height:
+					message = (Client.position_template.format(player=player)).encode('utf-8')
+					client.writer.write(message)
 					continue
-				player = player._replace(x=x, y=y)
+				player = player._replace(x=x, y=y, direction=direction)
 				self.players[id] = player
-				message = (Client.position_template % {'player': player}).encode('utf-8')
-				for id in self.clients_set - id:
+				message = (Client.position_template.format(player=player)).encode('utf-8')
+				for id in self.clients_set:
 					self.clients[id].writer.write(message)
 
 			for intention in left:
 				id = intention.id
-				del self.players[id]
+				if id in self.players:
+					del self.players[id]
 				self.clients_set.remove(id)
 				client = self.clients.pop(id)
 				client.stopped = True
@@ -143,19 +157,19 @@ class Battle:
 				x, y = self.spawn()
 				client = self.clients[id]
 
-				new_player = Player(id, intention.value, x, y, 0)
-				print('p %r id=%r' %(new_player, new_player.id))
-				id_message = Client.id_template % {'player': new_player}
-				joined_message = Client.joined_template % {'player': new_player}
-
+				new_player = Player(id, intention.value, x, y, Direction(0))
 				self.players[id] = new_player
-				for player in self.players.values():
-					message = Client.joined_template % {'player': player}
-					client.writer.write(message.encode('utf-8'))
-				client.writer.write(message.encode('utf-8'))
 
+				for player in self.players.values():
+					message = Client.joined_template.format(player=player)
+					client.writer.write(message.encode('utf-8'))
+
+				id_message = Client.id_template.format(player=new_player)
+				client.writer.write(id_message.encode('utf-8'))
+
+				joined_message = Client.joined_template.format(player=new_player)
 				message = joined_message.encode('utf-8')
-				for id in self.clients_set - id:
+				for id in self.clients_set - {id,}:
 					self.clients[id].writer.write(message)
 
 	def spawn(self):
