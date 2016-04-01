@@ -28,83 +28,113 @@ STEP_DELTA = {
 }
 Intention = namedtuple('Intention', 'id action value')
 Player = namedtuple('Player', 'id color x y direction')
+Envinronment = namedtuple('Envinronment', 'id name log')
 
 
-class Client:
-	joined_template = 'joined {player.id:d} {player.color:s} {player.x:d} {player.y:d} {player.direction.value:d}\n'
-	id_template = 'id {player.id:d}\n'
-	position_template = 'position {player.id:d} {player.x:d} {player.y:d} {player.direction.value:d}\n'
+client_joined_template = 'joined {player.id:d} {player.color:s} {player.x:d} {player.y:d} {player.direction.value:d}\n'
+client_id_template = 'id {player.id:d}\n'
+client_position_template = 'position {player.id:d} {player.x:d} {player.y:d} {player.direction.value:d}\n'
+client_bye_template = 'bye {player.id:d}\n'
 
-	def __init__(self, name, id, intentions, reader, writer):
-		self.pong = name.encode('utf-8') + b'\n'
-		self.id = id
-		self.intentions = intentions
-		self.reader = reader
-		self.writer = writer
 
-		self.stopped = False
+async def parse_intentions(envinronment, stopped, intentions, reader, writer):
+	handlers = ('ping', 'hello', 'move', 'fire')
+	pong = envinronment.name.encode('utf-8') + b'\n'
+	while not stopped.is_set():
+		try:
+			done, pending = await asyncio.wait((reader.readline(), stopped.wait()), return_when=concurrent.futures.FIRST_COMPLETED)
+			# stopped anyway
+			if not pending:
+				return
 
-	async def process(self):
-		handlers = ('ping', 'hello', 'move', 'fire')
-		while not self.stopped:
-			try:
-				command = (await self.reader.readline()).decode('utf-8')
-				if not command:
-					if self.reader.at_eof():
-						raise EOFError
-					continue
-			except Exception as e:
-				self.intentions.put_nowait(Intention(self.id, Action.terminate, e))
-				break
+			del pending
 
-			logging.info('command %r', command)
-			name, *values = command[:-1].split(' ')
-			if name not in handlers:
+			result = done.pop().result()
+			# stopped answer
+			if result is True:
+				return
+
+			command = result.decode('utf-8')
+			if not command:
+				if reader.at_eof():
+					raise EOFError
 				continue
+			envinronment.log.debug('command %r', command)
 
-			if name == 'ping':
-				self.writer.write(self.pong)
-			elif name == 'hello':
-				color, *_ = values
-				self.intentions.put_nowait(Intention(self.id, Action.recognize, color))
-			elif name == 'move':
-				direction, *_ = values
-				direction = int(direction, 10)
-				self.intentions.put_nowait(Intention(self.id, Action.move, Direction(direction)))
-			elif name == 'fire':
-				self.intentions.put_nowait(Intention(self.id, Action.fire, None))
+		except Exception as e:
+			envinronment.log.debug('terminated with %r', e)
+			intentions.put_nowait(Intention(envinronment.id, Action.terminate, e))
+			break
+
+		name, *values = command[:-1].split(' ')
+		if name not in handlers:
+			envinronment.log.debug('name %r was not recognized', name)
+			continue
+
+		if name == 'ping':
+			envinronment.log.debug('pong')
+			writer.write(pong)
+			continue
+
+		if name == 'hello':
+			color, *_ = values
+			intention = Intention(envinronment.id, Action.recognize, color)
+		elif name == 'move':
+			direction, *_ = values
+			direction = int(direction, 10)
+			intention = Intention(envinronment.id, Action.move, Direction(direction))
+		elif name == 'fire':
+			intention = Intention(envinronment.id, Action.fire, None)
+		else:
+			envinronment.log.warn('programming error: command name %r was not handled', name)
+			continue
+
+		envinronment.log.debug('command parsed as %r', intention)
+		intentions.put_nowait(intention)
 
 
 class Battle:
-	name = 'PY_battle'
+	name = 'tataserver'
 
 	def __init__(self, width, height):
 		self.width = width
 		self.height = height
-		self.spawn_delta = min(width, height) * 100 # 30
+		self.spawn_delta = min(width, height) * 100 // 30
+
 		self.intentions = asyncio.Queue()
+		self.reread_parsers = asyncio.Event()
+
 		self.counter = count()
-		self.clients = {}
 		self.clients_set = set()
+		self.connections = {}
+		self.parsers = {}
 		self.players = {}
-		self.stopped = asyncio.Event()
+		self.logger = logging.getLogger('battle')
+
+	def run_parser(self, id, reader, writer):
+		parser_knife_switch = asyncio.Event()
+		parser = parse_intentions(
+			Envinronment(id=id, name=self.name, log=self.logger.getChild('connection[%d]' % id)),
+			parser_knife_switch,
+			self.intentions,
+			reader,
+			writer
+		)
+		parser_future = asyncio.ensure_future(parser)
+		return parser_knife_switch, parser_future
 
 	def connection_made(self, reader, writer):
 		id = next(self.counter)
-		client = Client(self.name, id, self.intentions, reader, writer)
-		self.clients[id] = client
+		(parser_knife_switch, parser_future) = self.run_parser(id, reader, writer)
+		self.parsers[id] = (parser_knife_switch, parser_future)
+		self.connections[id] = (reader, writer)
 		self.clients_set.add(id)
-		asyncio.ensure_future(client.process())
+
+		self.reread_parsers.set()
 
 	async def loop(self):
 		while True:
-			done, _ = await asyncio.wait((self.stopped.wait(), self.intentions.get()), return_when=concurrent.futures.FIRST_COMPLETED)
-			if len(done) == 2 or True in done:
-				for client in self.clients.values():
-					client.stopped = True
-				break
-
-			intention = done.pop().result()
+			intention = await self.intentions.get()
 			moved = []
 			left = []
 			joined = []
@@ -126,59 +156,88 @@ class Battle:
 				direction = intention.value
 				player = self.players[id]
 				delta = STEP_DELTA[direction]
-				client = self.clients[id]
 
 				x = player.x + delta[0]
 				if x < 0 or x >= self.width:
-					message = (Client.position_template.format(player=player)).encode('utf-8')
-					client.writer.write(message)
+					message = (client_position_template.format(player=player)).encode('utf-8')
+					writer = self.connections[id][1]
+					writer.write(message)
 					continue
 				y = player.y + delta[1]
 				if y < 0 or y >= self.height:
-					message = (Client.position_template.format(player=player)).encode('utf-8')
-					client.writer.write(message)
+					message = (client_position_template.format(player=player)).encode('utf-8')
+					writer = self.connections[id][1]
+					writer.write(message)
 					continue
 				player = player._replace(x=x, y=y, direction=direction)
-				self.players[id] = player
-				message = (Client.position_template.format(player=player)).encode('utf-8')
-				for id in self.clients_set:
-					self.clients[id].writer.write(message)
 
+				self.players[id] = player
+				message = (client_position_template.format(player=player)).encode('utf-8')
+				for _, writer in self.connections.values():
+					writer.write(message)
+
+			bye = bytearray()
 			for intention in left:
 				id = intention.id
-				if id in self.players:
-					del self.players[id]
+				# reverse order from connection_made
 				self.clients_set.remove(id)
-				client = self.clients.pop(id)
-				client.stopped = True
+				reader, writer = self.connections.pop(id)
+				reader.feed_eof
+				writer.close()
+				parser_knife_switch, parser_future = self.parsers.pop(id)
+				# ???: should we cancel parser_future
+				parser_knife_switch.set()
+				if id in self.players:
+					bye += client_bye_template.format(player=self.players.pop(id)).encode('utf-8')
+
+			if bye:
+				for _, writer in self.connections.values():
+					writer.write(bye)
 
 			for intention in joined:
 				id = intention.id
 				x, y = self.spawn()
-				client = self.clients[id]
+				writer = self.connections[id][1]
 
 				new_player = Player(id, intention.value, x, y, Direction(0))
 				self.players[id] = new_player
 
 				for player in self.players.values():
-					message = Client.joined_template.format(player=player)
-					client.writer.write(message.encode('utf-8'))
+					message = client_joined_template.format(player=player)
+					writer.write(message.encode('utf-8'))
 
-				id_message = Client.id_template.format(player=new_player)
-				client.writer.write(id_message.encode('utf-8'))
+				id_message = client_id_template.format(player=new_player)
+				writer.write(id_message.encode('utf-8'))
 
-				joined_message = Client.joined_template.format(player=new_player)
+				joined_message = client_joined_template.format(player=new_player)
 				message = joined_message.encode('utf-8')
 				for id in self.clients_set - {id,}:
-					self.clients[id].writer.write(message)
+					writer = self.connections[id][1]
+					writer.write(message)
+
+	async def parser_failover(self):
+		while True:
+			reread_event = self.reread_parsers.wait()
+			parsers_future = tuple(p[1] for p in self.parsers.values())
+			await asyncio.wait((reread_event,)+parsers_future, return_when=concurrent.futures.FIRST_COMPLETED)
+
+			for id, p in self.parsers.copy().items():
+				task = p[1]
+				# FIXME: handle case when parser exits normally, but connection and player are here
+				if not task.cancelled() and task.done() and task.exception():
+					self.logger.warning('failover parser %d from exception %r', id, task.exception())
+					(parser_knife_switch, parser_future) = self.run_parser(id, *self.connections[id])
+					self.parsers[id] = (parser_knife_switch, parser_future)
+
+			self.reread_parsers.clear()
 
 	def spawn(self):
 		x = randrange(0, self.width)
 		y = randrange(0, self.height)
 		for player in self.players.values():
 			if player.x == x and player.y == y:
-				x += randint(1, self.spawn_delta) * choice(-1, 1)
-				y += randint(1, self.spawn_delta) * choice(-1, 1)
+				x += randint(1, self.spawn_delta) * choice((-1, 1))
+				y += randint(1, self.spawn_delta) * choice((-1, 1))
 				x = min(0, x, self.width)
 				y = min(0, y, self.height)
 		return x, y
@@ -186,10 +245,9 @@ class Battle:
 
 async def manage_battle():
 	battle = Battle(16, 16)
-	server = await asyncio.start_server(battle.connection_made, port=9999)
+	await asyncio.start_server(battle.connection_made, port=9999)
 	asyncio.ensure_future(battle.loop())
-	await server.wait_closed()
-	battle.stopped.set()
+	asyncio.ensure_future(battle.parser_failover())
 
 
 def ask_exit(loop, signame):
