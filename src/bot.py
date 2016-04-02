@@ -38,14 +38,17 @@ async def bot():
 			await asyncio.sleep(sleep)
 			if randint(0, fire_frequency) == fire_frequency:
 				writer.write(b'fire\n')
-				continue
 			writer.write(b'move %d\n' % randint(0, 3))
 			start = perf_counter()
 			while True:
 				message = (await reader.readline()).decode('utf-8')
 				assert message
-				command, id, *_ = message[:-1].split()
-				#print(command, id, *_)
+				command, id, *rest = message[:-1].split()
+				#if command == 'missile':
+				#	if id == self_id and rest[-1] == '-':
+				#		end = perf_counter()
+				#		delay.append((end-start)*1000)
+				#		break
 				if command == 'position' and id == self_id:
 					end = perf_counter()
 					delay.append((end-start)*1000)
