@@ -19,7 +19,7 @@ async def bot():
 	l = 'localhost'
 	sleep = 0
 	fire_frequency = 5
-	actions_count = 100
+	actions_count = 1000
 	reader, writer = await asyncio.open_connection(host=l, port=9999)
 	writer.write(b'ping\n')
 	pong = await reader.readline()
@@ -44,7 +44,8 @@ async def bot():
 			while True:
 				message = (await reader.readline()).decode('utf-8')
 				assert message
-				command, id, *_ = message.split()
+				command, id, *_ = message[:-1].split()
+				#print(command, id, *_)
 				if command == 'position' and id == self_id:
 					end = perf_counter()
 					delay.append((end-start)*1000)

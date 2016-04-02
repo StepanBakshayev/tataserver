@@ -42,12 +42,14 @@ async def parse_intentions(envinronment, stopped, intentions, reader, writer):
 	pong = envinronment.name.encode('utf-8') + b'\n'
 	while not stopped.is_set():
 		try:
-			done, pending = await asyncio.wait((reader.readline(), stopped.wait()), return_when=concurrent.futures.FIRST_COMPLETED)
+			future_stop = asyncio.ensure_future(stopped.wait())
+			done, pending = await asyncio.wait((reader.readline(), future_stop), return_when=concurrent.futures.FIRST_COMPLETED)
 			# stopped anyway
 			if not pending:
 				return
 
-			del pending
+			# prevent futures leak through the accumulation of Event._waiter
+			future_stop.cancel()
 
 			result = done.pop().result()
 			# stopped answer
@@ -217,9 +219,12 @@ class Battle:
 
 	async def parser_failover(self):
 		while True:
-			reread_event = self.reread_parsers.wait()
+			future_reread = asyncio.ensure_future(self.reread_parsers.wait())
 			parsers_future = tuple(p[1] for p in self.parsers.values())
-			await asyncio.wait((reread_event,)+parsers_future, return_when=concurrent.futures.FIRST_COMPLETED)
+			await asyncio.wait((future_reread,)+parsers_future, return_when=concurrent.futures.FIRST_COMPLETED)
+
+			# prevent futures leak through the accumulation of Event._waiter
+			future_reread.cancel()
 
 			for id, p in self.parsers.copy().items():
 				task = p[1]
