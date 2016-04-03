@@ -17,9 +17,9 @@ from time import perf_counter
 async def bot():
 	w = '10.0.2.29'
 	l = 'localhost'
-	sleep = 0
+	sleep = 0.1
 	fire_frequency = 5
-	actions_count = 1000
+	actions_count = 100
 	reader, writer = await asyncio.open_connection(host=l, port=9999)
 	writer.write(b'ping\n')
 	pong = await reader.readline()
@@ -33,29 +33,45 @@ async def bot():
 			break
 
 	delay = []
+	score = 0
 	try:
+		can_fire = True
+		x = 0
 		for x in range(actions_count):
-			await asyncio.sleep(sleep)
-			if randint(0, fire_frequency) == fire_frequency:
+			if can_fire:
 				writer.write(b'fire\n')
+				can_fire = False
+				# prevent self distraction
+				await asyncio.sleep(0.1*3)
+				continue
+
+			await asyncio.sleep(sleep)
 			writer.write(b'move %d\n' % randint(0, 3))
 			start = perf_counter()
 			while True:
 				message = (await reader.readline()).decode('utf-8')
 				assert message
 				command, id, *rest = message[:-1].split()
-				#if command == 'missile':
-				#	if id == self_id and rest[-1] == '-':
-				#		end = perf_counter()
-				#		delay.append((end-start)*1000)
-				#		break
-				if command == 'position' and id == self_id:
-					end = perf_counter()
-					delay.append((end-start)*1000)
-					break
+				killed = False
+				if id == self_id:
+					#print(command, *rest)
+					if command == 'score':
+						score = int(rest[0], 10)
+					elif command == 'missile' and rest[0] == '-':
+						can_fire = True
+					elif command == 'die':
+						print(id, 'killed')
+						killed = True
+					elif command == 'position':
+						if killed:
+							print(id, 'respawn', *rest)
+						end = perf_counter()
+						delay.append((end-start)*1000)
+						break
 	finally:
 		if len(delay):
-			print('avg(ms):', sum(delay)/len(delay), 'min(ms):', min(delay), 'max(ms):', max(delay))
+			x += 1
+			print('avg(ms): %d min(ms): %d max(ms): %d score: %d turns %d%%' % (sum(delay)/len(delay), min(delay), max(delay), score, x/actions_count*100))
 
 
 def main():
