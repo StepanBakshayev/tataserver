@@ -17,9 +17,9 @@ from time import perf_counter
 async def bot():
 	w = '10.0.2.29'
 	l = 'localhost'
-	sleep = 0.1
+	sleep = 0.05
 	fire_frequency = 5
-	actions_count = 100000
+	actions_count = 1000
 	reader, writer = await asyncio.open_connection(host=l, port=9999)
 	writer.write(b'ping\n')
 	pong = await reader.readline()
@@ -38,11 +38,14 @@ async def bot():
 		can_fire = True
 		x = 0
 		for x in range(actions_count):
+			if reader.at_eof():
+				break
+
 			if can_fire:
 				writer.write(b'fire\n')
 				can_fire = False
 				# prevent self distraction
-				await asyncio.sleep(0.1*3)
+				await asyncio.sleep(0.1)
 				continue
 
 			await asyncio.sleep(sleep)
@@ -50,7 +53,10 @@ async def bot():
 			start = perf_counter()
 			while True:
 				message = (await reader.readline()).decode('utf-8')
-				assert message
+				if not message:
+					if reader.at_eof():
+						break
+					assert message
 				command, id, *rest = message[:-1].split()
 				killed = False
 				if id == self_id:
@@ -59,12 +65,7 @@ async def bot():
 						score = int(rest[0], 10)
 					elif command == 'missile' and rest[0] == '-':
 						can_fire = True
-					elif command == 'die':
-						print(id, 'killed')
-						killed = True
 					elif command == 'position':
-						if killed:
-							print(id, 'respawn', *rest)
 						end = perf_counter()
 						delay.append((end-start)*1000)
 						break

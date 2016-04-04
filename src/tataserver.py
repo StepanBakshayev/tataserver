@@ -160,17 +160,17 @@ class Battle:
 		 4) turn out arrived missiles to free missiles
 		 5) push forward [all] arrived missiles
 		 6) detonate missiles on collision
-		   1) case out missile
-		   2) case free missile
+		   1) case out missile: out missile does not hurt owner player in launch point
+		   2) case free missile: free missile destroyes everybody
 		 7) let playes shoot
-		   + show millise on screen and emergency jump to detonation by turning next iteration immideatly
+		   + show millise on screen and emergency jump to detonation by turning next iteration immediately
 		 8) spawn joined players
 		 9) spawn dead players
 
 		Consequences are:
 		 - lost connections player takes away possible score (it is easy to prevent if I sure about stream read/write process in this case)
-		 - owner of out missile takes zero damage in launch point (no thoughts how to prevent)
-		 - player in point where missile out will be killed very likely
+		 - owner of out missile takes zero damage in launch point (no thoughts how to prevent it easy)
+		 - player in point where other player launch missile out will be killed very likely
 
 		Wishes are:
 		 - players should push each other on collision
@@ -261,6 +261,13 @@ class Battle:
 					message = '%s: players are nowhere %r after intentions %r'
 					args = step, lost_players, intentions
 					raise RuntimeError(message % args)
+
+				mappings.pop('dead_players')
+				for name, map in mappings.items():
+					for obj in map.values():
+						if obj.x < 0 or obj.x >= self.width or\
+							obj.y < 0 or obj.y >= self.height:
+							raise RuntimeError('object %r from "%s" is out battle' % (obj, name))
 
 			# 2) release resources of left players
 			bye = []
@@ -422,12 +429,16 @@ class Battle:
 			ensure_consistency('7) let playes shoot', all_players)
 
 			# 7) let playes shoot
+			#   + show millise on screen and emergency jump to detonation by turning next iteration immediately
+			shoot = False
 			for intention in fired.values():
 				id, *_ = intention
 				if id in self.dead_players or \
 					id in self.out_missiles or \
 					id in self.free_missiles:
 					continue
+
+				shoot = True
 
 				player = self.alive_players[id]
 				delta = STEP_DELTA[player.direction]
@@ -498,13 +509,14 @@ class Battle:
 				sleep_future = asyncio.Future()
 			else:
 				intention_future = asyncio.ensure_future(self.intentions.get())
-				wait = (intention_future,)
-				sleep_future = asyncio.Future()
-				event_sources = (self.out_missiles, self.free_missiles, self.dead_players)
-				if any(event_sources):
-					next_source = min(chain.from_iterable(source.values() for source in event_sources), key=lambda v: v.future_moment)
-					sleep_future = asyncio.ensure_future(asyncio.sleep(next_source.future_moment-loop.time()))
-					wait += (sleep_future,)
+				if not shoot:
+					wait += (intention_future,)
+					sleep_future = asyncio.Future()
+					event_sources = (self.out_missiles, self.free_missiles, self.dead_players)
+					if any(event_sources):
+						next_source = min(chain.from_iterable(source.values() for source in event_sources), key=lambda v: v.future_moment)
+						sleep_future = asyncio.ensure_future(asyncio.sleep(next_source.future_moment-loop.time()))
+						wait += (sleep_future,)
 
 			end_time = loop.time()
 			time_ms = end_time - start_time
@@ -546,8 +558,8 @@ class Battle:
 			if holded_x == x and holded_y == y:
 				x += randint(1, self.spawn_delta)
 				y += randint(1, self.spawn_delta) * choice((-1, 1))
-				x = min(0, x, self.width)
-				y = min(0, y, self.height)
+				x = min(0, x, self.width-1)
+				y = min(0, abs(y), self.height-1)
 
 		return x, y
 
