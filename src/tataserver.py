@@ -163,6 +163,7 @@ class Battle:
 		   1) case out missile
 		   2) case free missile
 		 7) let playes shoot
+		   + show millise on screen and emergency jump to detonation by turning next iteration immideatly
 		 8) spawn joined players
 		 9) spawn dead players
 
@@ -176,7 +177,7 @@ class Battle:
 		"""
 		MISSILE_VELOCITY_S = MISSILE_VELOCITY_MS / 1000
 		BATTLELOOP_DEADLINE_S = BATTLELOOP_DEADLINE_MS / 1000
-		DEATH_DURATION_S = DEATH_DURATION_MS/1000
+		DEATH_DURATION_S = DEATH_DURATION_MS / 1000
 
 		loop = asyncio.get_event_loop()
 		intention_future = asyncio.ensure_future(self.intentions.get())
@@ -239,6 +240,28 @@ class Battle:
 				if remaining_intentions:
 					self.logger.warning('there are %d remaining intentions in queue', remaining_intentions)
 
+			def ensure_consistency(step, all_players):
+				mappings = dict(
+					alive_players=self.alive_players,
+					dead_players=self.dead_players,
+					out_missiles=self.out_missiles,
+					free_missiles=self.free_missiles
+				)
+				for name, map in mappings.items():
+					for key, value in map.items():
+						if key != value.id:
+							message = '%s: index broken (%r, %r) in "%s" %r'
+							args = step, key, value, name, map
+							raise RuntimeError(message % args)
+
+				if len(self.alive_players) + len(self.dead_players) < len(all_players):
+					id_lost_players = (self.alive_players.keys() | self.dead_players.keys()) ^ all_players.keys()
+					lost_players = tuple(all_players[id] for id in id_lost_players)
+					intentions = tuple(chain(moved.values(), left.values(), fired.values(), joined.values()))
+					message = '%s: players are nowhere %r after intentions %r'
+					args = step, lost_players, intentions
+					raise RuntimeError(message % args)
+
 			# 2) release resources of left players
 			bye = []
 			for intention in left.values():
@@ -263,6 +286,11 @@ class Battle:
 			if bye:
 				for _, writer in self.connections.values():
 					writer.writelines(bye)
+
+			all_players = self.alive_players.copy()
+			all_players.update(self.dead_players.copy())
+
+			ensure_consistency('3) let players make turn', all_players)
 
 			# 3) let players make turn
 			for intention in moved.values():
@@ -293,6 +321,8 @@ class Battle:
 				for _, writer in self.connections.values():
 					writer.write(message)
 
+			ensure_consistency('4) turn out arrived missiles to free missiles', all_players)
+
 			# 4) turn out arrived missiles to free missiles
 			released_missiles = []
 			for missile in self.out_missiles.copy().values():
@@ -301,6 +331,8 @@ class Battle:
 
 				del self.out_missiles[missile.id]
 				released_missiles.append(missile)
+
+			ensure_consistency('5) push forward [all] arrived missiles', all_players)
 
 			# 5) push forward [all] arrived missiles
 			for missile in chain(self.free_missiles.copy().values(), released_missiles):
@@ -330,50 +362,64 @@ class Battle:
 				for _, writer in self.connections.values():
 					writer.write(message)
 
+			ensure_consistency('6.1) case out missile', all_players)
+
 			# 6) detonate missiles on collision
 			#   1) case out missile
 			for missile in self.out_missiles.copy().values():
-				for player in self.alive_players.copy().values():
-					if player.id != missile.id and player.x == missile.x and player.y == missile.y or \
-						player.x == missile.to_x and player.y == missile.to_y:
-						del self.out_missiles[missile.id]
-						message_missile_destoy = client_missile_destroy_template.format(missile=missile).encode('utf-8')
+				detonated = []
+				for victim in self.alive_players.copy().values():
+					if victim.id != missile.id and victim.x == missile.x and victim.y == missile.y or \
+						victim.x == missile.to_x and victim.y == missile.to_y:
+						if missile.id not in detonated:
+							detonated.append(missile.id)
+							del self.out_missiles[missile.id]
+							message_missile_destoy = client_missile_destroy_template.format(missile=missile).encode('utf-8')
 
-						del self.alive_players[player.id]
-						self.dead_players[player.id] = player._replace(future_moment=moment+DEATH_DURATION_S)
-						message_player_die = client_player_die_template.format(player=player).encode('utf-8')
+						del self.alive_players[victim.id]
+						self.dead_players[victim.id] = victim._replace(future_moment=moment+DEATH_DURATION_S)
+						message_player_die = client_player_die_template.format(player=victim).encode('utf-8')
 
 						message_player_score = b''
-						if player.id != missile.id:
+						if victim.id != missile.id:
 							storage = self.alive_players if missile.id in self.alive_players else self.dead_players
-							storage[missile.id] = storage[missile.id]._replace(score=player.score+1)
-							message_player_score = client_player_score_template.format(player=player).encode('utf-8')
+							missile_owner = storage[missile.id]
+							storage[missile_owner.id] = missile_owner._replace(score=missile_owner.score+1)
+							message_player_score = client_player_score_template.format(player=missile_owner).encode('utf-8')
 
 						message = (message_missile_destoy, message_player_die, message_player_score)
 						for _, writer in self.connections.values():
 							writer.writelines(message)
+
+			ensure_consistency('6.2) case free missile', all_players)
 
 			#   2) case free missile
 			for missile in self.free_missiles.copy().values():
-				for player in self.alive_players.copy().values():
-					if player.x == missile.x and player.y == missile.y or \
-						player.x == missile.to_x and player.y == missile.to_y:
-						del self.free_missiles[missile.id]
-						message_missile_destoy = client_missile_destroy_template.format(missile=missile).encode('utf-8')
+				detonated = []
+				for victim in self.alive_players.copy().values():
+					if victim.x == missile.x and victim.y == missile.y or \
+						victim.x == missile.to_x and victim.y == missile.to_y:
+						if missile.id not in detonated:
+							detonated.append(missile.id)
+							del self.free_missiles[missile.id]
+							message_missile_destoy = client_missile_destroy_template.format(missile=missile).encode('utf-8')
 
-						del self.alive_players[player.id]
-						self.dead_players[player.id] = player._replace(future_moment=moment+DEATH_DURATION_S)
-						message_player_die = client_player_die_template.format(player=player).encode('utf-8')
+						del self.alive_players[victim.id]
+						self.dead_players[victim.id] = victim._replace(future_moment=moment+DEATH_DURATION_S)
+						message_player_die = client_player_die_template.format(player=victim).encode('utf-8')
 
 						message_player_score = b''
-						if player.id != missile.id:
+						if victim.id != missile.id:
 							storage = self.alive_players if missile.id in self.alive_players else self.dead_players
-							storage[missile.id] = storage[missile.id]._replace(score=player.score+1)
-							message_player_score = client_player_score_template.format(player=player).encode('utf-8')
+							missile_owner = storage[missile.id]
+							storage[missile_owner.id] = missile_owner._replace(score=missile_owner.score+1)
+							message_player_score = client_player_score_template.format(player=missile_owner).encode('utf-8')
 
 						message = (message_missile_destoy, message_player_die, message_player_score)
 						for _, writer in self.connections.values():
 							writer.writelines(message)
+
+			ensure_consistency('7) let playes shoot', all_players)
 
 			# 7) let playes shoot
 			for intention in fired.values():
@@ -383,8 +429,6 @@ class Battle:
 					id in self.free_missiles:
 					continue
 
-				if id not in self.alive_players:
-					self.logger.error('a %r\n d %r\n o %r\n f %r', self.alive_players, self.dead_players, self.out_missiles, self.free_missiles)
 				player = self.alive_players[id]
 				delta = STEP_DELTA[player.direction]
 				missile = Missile(
@@ -398,6 +442,8 @@ class Battle:
 				for _, writer in self.connections.values():
 					writer.write(message)
 
+			ensure_consistency('8) spawn joined players', all_players)
+
 			# 8) spawn joined players
 			for intention in joined.values():
 				id, _, color = intention
@@ -409,6 +455,15 @@ class Battle:
 				for player in self.alive_players.values():
 					message = client_joined_template.format(player=player).encode('utf-8')
 					writer.write(message)
+				for player in self.dead_players.values():
+					message = client_joined_template.format(player=player).encode('utf-8')
+					writer.write(message)
+					message = client_player_die_template.format(player=player).encode('utf-8')
+					writer.write(message)
+				for missile in chain(self.free_missiles.values(), self.out_missiles.values()):
+					message = client_missile_position_template.format(missile=missile).encode('utf-8')
+					writer.write(message)
+
 				message = client_id_template.format(player=new_player).encode('utf-8')
 				writer.write(message)
 
@@ -416,6 +471,8 @@ class Battle:
 				for id in self.clients_set - {id,}:
 					writer = self.connections[id][1]
 					writer.write(message)
+
+			ensure_consistency('9) spawn dead players', all_players)
 
 			# 9) spawn dead players
 			for player in self.dead_players.copy().values():
@@ -425,11 +482,13 @@ class Battle:
 				del self.dead_players[player.id]
 				x, y = self.spawn()
 				player = player._replace(x=x, y=y, future_moment=None)
-				self.alive_players[id] = player
+				self.alive_players[player.id] = player
 
 				message = client_player_position_template.format(player=player).encode('utf-8')
 				for _, writer in self.connections.values():
 					writer.write(message)
+
+			ensure_consistency('end', all_players)
 
 			# crude loop schedule
 			wait = ()

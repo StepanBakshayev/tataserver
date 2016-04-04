@@ -19,7 +19,7 @@ async def bot():
 	l = 'localhost'
 	sleep = 0.1
 	fire_frequency = 5
-	actions_count = 100
+	actions_count = 100000
 	reader, writer = await asyncio.open_connection(host=l, port=9999)
 	writer.write(b'ping\n')
 	pong = await reader.readline()
