@@ -17,7 +17,7 @@ from time import perf_counter
 async def bot():
 	w = '10.0.2.29'
 	l = 'localhost'
-	sleep = 0
+	sleep = 0.1
 	actions_count = 1000
 	reader, writer = await asyncio.open_connection(host=l, port=9999)
 	writer.write(b'ping\n')
