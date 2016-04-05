@@ -17,8 +17,7 @@ from time import perf_counter
 async def bot():
 	w = '10.0.2.29'
 	l = 'localhost'
-	sleep = 0.05
-	fire_frequency = 5
+	sleep = 0
 	actions_count = 1000
 	reader, writer = await asyncio.open_connection(host=l, port=9999)
 	writer.write(b'ping\n')
@@ -56,7 +55,7 @@ async def bot():
 				if not message:
 					if reader.at_eof():
 						break
-					assert message
+				assert message
 				command, id, *rest = message[:-1].split()
 				killed = False
 				if id == self_id:

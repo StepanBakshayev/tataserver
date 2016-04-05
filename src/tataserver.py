@@ -101,6 +101,7 @@ async def parse_intentions(envinronment, stopped, intentions, reader, writer):
 
 		envinronment.logger.debug('command parsed as %r', intention)
 		intentions.put_nowait(intention)
+		await intentions.join()
 
 
 class Battle:
@@ -154,7 +155,6 @@ class Battle:
 		"""
 		Loop implementaion is game rules. Game rules are:
 		 1) iterate intentions and sort in left, moved, fired, joined
-		   + free sorted intentions for terminated connections
 		 2) release resources of left players
 		 3) let players make turn
 		 4) turn out arrived missiles to free missiles
@@ -202,43 +202,25 @@ class Battle:
 			joined = {}
 
 			# 1) iterate intentions and sort in left, moved, fired, joined
-			#  + free sorted intentions for terminated connections
 			if intention_future.done():
 				intention = intention_future.result()
+				self.intentions.task_done()
+
 				sorter = {
 					Action.recognize: joined,
 					Action.move: moved,
 					Action.terminate: left,
 					Action.fire: fired,
 				}
-				clients_maked_turn = []
-				# intentions are not only things happen on battle field
-				# so delay it to next time, but increase CPU utilization
-				while (loop.time() - start_time) < BATTLELOOP_DEADLINE_S:
+				while True:
 					self.logger.debug('intention %r', intention)
+					sorter[intention.action][intention.id] = intention
 
-					if intention.action == Action.terminate:
-						sorter[Action.terminate][intention.id] = intention
-						# it is useless to write in closed connection
-						# avoid it by removing all scheduled intentions
-						if intention.id in clients_maked_turn:
-							for action in (Action.recognize, Action.move, Action.fire):
-								if intention.id in sorter[action]:
-									del sorter[action][intention.id]
-						clients_maked_turn.append(intention.id)
-
-					elif intention.id not in clients_maked_turn and intention.action in sorter:
-						sorter[intention.action][intention.id] = intention
-						clients_maked_turn.append(intention.id)
-
-					try:
-						intention = self.intentions.get_nowait()
-					except asyncio.QueueEmpty:
+					if self.intentions.qsize() == 0:
 						break
 
-				remaining_intentions = self.intentions.qsize()
-				if remaining_intentions:
-					self.logger.warning('there are %d remaining intentions in queue', remaining_intentions)
+					intention = self.intentions.get_nowait()
+					self.intentions.task_done()
 
 			def ensure_consistency(step, all_players):
 				mappings = dict(
@@ -503,20 +485,15 @@ class Battle:
 
 			# crude loop schedule
 			wait = ()
-			if self.intentions.qsize():
-				intention_future = asyncio.Future()
-				intention_future.set_result(self.intentions.get_nowait())
+			intention_future = asyncio.ensure_future(self.intentions.get())
+			if not shoot:
+				wait += (intention_future,)
 				sleep_future = asyncio.Future()
-			else:
-				intention_future = asyncio.ensure_future(self.intentions.get())
-				if not shoot:
-					wait += (intention_future,)
-					sleep_future = asyncio.Future()
-					event_sources = (self.out_missiles, self.free_missiles, self.dead_players)
-					if any(event_sources):
-						next_source = min(chain.from_iterable(source.values() for source in event_sources), key=lambda v: v.future_moment)
-						sleep_future = asyncio.ensure_future(asyncio.sleep(next_source.future_moment-loop.time()))
-						wait += (sleep_future,)
+				event_sources = (self.out_missiles, self.free_missiles, self.dead_players)
+				if any(event_sources):
+					next_source = min(chain.from_iterable(source.values() for source in event_sources), key=lambda v: v.future_moment)
+					sleep_future = asyncio.ensure_future(asyncio.sleep(next_source.future_moment-loop.time()))
+					wait += (sleep_future,)
 
 			end_time = loop.time()
 			time_ms = end_time - start_time
