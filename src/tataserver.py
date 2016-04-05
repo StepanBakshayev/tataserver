@@ -17,6 +17,7 @@ from collections import namedtuple
 from itertools import count, chain
 from random import randrange, choice, randint
 import logging
+import socket
 
 
 Action = Enum('Action', 'recognize move fire terminate', start=0)
@@ -142,6 +143,9 @@ class Battle:
 		return parser_knife_switch, parser_future
 
 	def connection_made(self, reader, writer):
+		sock = writer.get_extra_info('socket')
+		sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+
 		id = next(self.counter)
 		(parser_knife_switch, parser_future) = self.run_parser(id, reader, writer)
 		self.parsers[id] = (parser_knife_switch, parser_future)
@@ -448,7 +452,7 @@ class Battle:
 			end_time = loop.time()
 			time_ms = end_time - start_time
 			if time_ms > BATTLELOOP_DEADLINE_S:
-				self.logger.warning('loop exceed time: it took %d ms', time_ms*1000)
+				self.logger.debug('loop exceed time: it took %d ms', time_ms*1000)
 
 	async def parser_failover(self):
 		while True:

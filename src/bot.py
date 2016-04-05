@@ -12,14 +12,19 @@ import asyncio
 import logging
 from random import randint
 from time import perf_counter
-
+import socket
+import json
+from collections import OrderedDict
+import math
 
 async def bot():
 	w = '10.0.2.29'
 	l = 'localhost'
-	sleep = 0.1
+	sleep = 0
 	actions_count = 1000
 	reader, writer = await asyncio.open_connection(host=l, port=9999)
+	sock = writer.get_extra_info('socket')
+	sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
 	writer.write(b'ping\n')
 	pong = await reader.readline()
 	assert pong
@@ -43,8 +48,6 @@ async def bot():
 			if can_fire:
 				writer.write(b'fire\n')
 				can_fire = False
-				# prevent self distraction
-				await asyncio.sleep(0.1)
 				continue
 
 			await asyncio.sleep(sleep)
@@ -71,7 +74,14 @@ async def bot():
 	finally:
 		if len(delay):
 			x += 1
-			print('avg(ms): %d min(ms): %d max(ms): %d score: %d turns %d%%' % (sum(delay)/len(delay), min(delay), max(delay), score, x/actions_count*100))
+			stats = OrderedDict((
+				('avg(ms)', math.floor(sum(delay)/len(delay))),
+				('min(ms)', math.floor(min(delay))),
+				('max(ms)', math.floor(max(delay))),
+				('score()', score),
+				('turns(%)', math.floor(x/actions_count*100)),
+			))
+			print(json.dumps(stats))
 
 
 def main():
