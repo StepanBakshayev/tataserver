@@ -40,6 +40,7 @@ async def bot():
 	score = 0
 	try:
 		can_fire = True
+		last_message = ''
 		x = 0
 		for x in range(actions_count):
 			if reader.at_eof():
@@ -60,6 +61,8 @@ async def bot():
 						break
 				assert message
 				command, id, *rest = message[:-1].split()
+				if id == self_id:
+					last_message = ('[%s]' % self_id, command, *rest)
 				killed = False
 				if id == self_id:
 					#print(command, *rest)
@@ -80,6 +83,8 @@ async def bot():
 				('max(ms)', math.floor(max(delay))),
 				('score()', score),
 				('turns(%)', math.floor(x/actions_count*100)),
+				('turns()', actions_count),
+				('last message', ' '.join(last_message)),
 			))
 			print(json.dumps(stats))
 
