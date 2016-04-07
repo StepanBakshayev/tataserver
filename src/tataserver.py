@@ -8,17 +8,16 @@
 # option. This file may not be copied, modified, or distributed
 # except according to those terms.
 
-import asyncio
-import functools
-import os
-import signal
-from enum import Enum
 from collections import namedtuple
+from enum import Enum
 from itertools import count, chain
 from random import randrange, choice, randint
-import logging
-import socket
+import asyncio
+import functools
 import inspect
+import logging
+import signal
+import socket
 
 
 Action = Enum('Action', 'recognize move fire terminate', start=0)
@@ -130,6 +129,7 @@ class Battle:
 		self.height = height
 		self.spawn_delta = min(width, height) * 100 // 30
 		self.connections = {}
+		self.alive_connections = []
 		self.parsers = {}
 		self.alive_players = {}
 		# if dead players is deque swawn algorithm is able to break on first out of time player
@@ -171,8 +171,8 @@ class Battle:
 		   + owner of missile takes zero damage
 		 6) let playes shoot
 		   + show millise on screen and emergency jump to detonation by turning next iteration immediately
-		 7) spawn joined players
-		 8) spawn dead players
+		 7) spawn dead players
+		 8) spawn joined players
 
 		Consequences are:
 		 - lost connections player takes away possible score (it is easy to prevent if I sure about stream read/write process in this case)
@@ -228,36 +228,37 @@ class Battle:
 					self.intentions.task_done()
 
 			# 2) release resources of left players
-			battle_clean_from(left, self.connections, self.parsers, self.alive_players, self.dead_players, self.missiles)
+			battle_clean_from(left, self.connections, self.alive_connections, self.parsers, self.alive_players, self.dead_players, self.missiles)
 
-			for _, writer in self.connections.values():
+			for writer in self.alive_connections:
 				sock = writer.get_extra_info('socket')
 				if sock.fileno() != -1:
 					sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_CORK, 1)
 
 			# 3) let players make turn
-			battle_transfer(moved, self.alive_players, self.width, self.height, self.connections)
+			battle_transfer(moved, self.alive_players, self.width, self.height, self.connections, self.alive_connections)
 
 			# 4) push forward arrived missiles
-			battle_push(moment, self.missiles, self.width, self.height, self.connections)
+			battle_push(moment, self.missiles, self.width, self.height, self.alive_connections)
 
 			# 5) detonate missiles on collision
-			battle_blow_up(moment, self.missiles, self.alive_players, self.dead_players, self.connections)
+			battle_blow_up(moment, self.missiles, self.alive_players, self.dead_players, self.alive_connections)
 
 			# 6) let playes shoot
 			#   + show millise on screen and emergency jump to detonation by turning next iteration immediately
-			shoot = battle_pull_the_trigger(moment, fired, self.missiles, self.alive_players, self.dead_players, self.connections)
+			shoot = battle_pull_the_trigger(moment, fired, self.missiles, self.alive_players, self.dead_players, self.alive_connections)
 
-			# 7) spawn joined players
-			battle_recognize(joined, self.width, self.height, self.spawn_delta, self.alive_players, self.missiles, self.dead_players, self.connections)
+			# 7) spawn dead players
+			battle_spawn(moment, self.dead_players, self.width, self.height, self.spawn_delta, self.alive_players, self.missiles, self.alive_connections)
 
-			# 8) spawn dead players
-			battle_spawn(moment, self.dead_players, self.width, self.height, self.spawn_delta, self.alive_players, self.missiles, self.connections)
+			# 8) spawn joined players
+			new_alive_connections = battle_recognize(joined, self.width, self.height, self.spawn_delta, self.alive_players, self.missiles, self.dead_players, self.connections, self.alive_connections)
 
-			for _, writer in self.connections.values():
+			for writer in self.alive_connections:
 				sock = writer.get_extra_info('socket')
 				if sock.fileno() != -1:
 					sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_CORK, 0)
+			self.alive_connections.extend(new_alive_connections)
 
 			# crude loop schedule
 			wait = ()
@@ -278,7 +279,8 @@ class Battle:
 			end_time = loop.time()
 			time_ms = end_time - start_time
 			if time_ms > BATTLELOOP_DEADLINE_S:
-				self.logger.debug('loop exceed time: it took %d ms', time_ms*1000)
+				#self.logger.warning('loop exceed time: it took %d ms', time_ms*1000)
+				pass
 
 	async def parser_failover(self):
 		while True:
@@ -354,7 +356,7 @@ def battle_ensure_consistency(function):
 	return wrapper
 
 
-def battle_clean_from(left, connections, parsers, alive_players, dead_players, missiles):
+def battle_clean_from(left, connections, alive_connections, parsers, alive_players, dead_players, missiles):
 	bye = []
 	for intention in left:
 		id, *_ = intention
@@ -365,21 +367,23 @@ def battle_clean_from(left, connections, parsers, alive_players, dead_players, m
 		parser_knife_switch, parser_future = parsers.pop(id)
 		# ???: should we cancel parser_future
 		parser_knife_switch.set()
-		for storage, template in \
-			(missiles, client_missile_destroy_template),\
-			(alive_players, client_player_bye_template),\
-			(dead_players, client_player_bye_template):
-			if id in storage:
-				value = storage.pop(id)
-				bye.append(template.format(missile=value, player=value).encode('utf-8'))
+		if writer in alive_connections:
+			alive_connections.remove(writer)
+			for storage, template in \
+				(missiles, client_missile_destroy_template),\
+				(alive_players, client_player_bye_template),\
+				(dead_players, client_player_bye_template):
+				if id in storage:
+					value = storage.pop(id)
+					bye.append(template.format(missile=value, player=value).encode('utf-8'))
 
 	if bye:
-		for _, writer in connections.values():
+		for writer in alive_connections:
 			writer.writelines(bye)
 
 
 @battle_ensure_consistency
-def battle_transfer(moved, alive_players, width, height, connections):
+def battle_transfer(moved, alive_players, width, height, connections, alive_connections):
 	for intention in moved:
 		id, _, direction = intention
 		if id not in alive_players:
@@ -405,12 +409,12 @@ def battle_transfer(moved, alive_players, width, height, connections):
 		alive_players[id] = player
 
 		message = client_player_position_template.format(player=player).encode('utf-8')
-		for _, writer in connections.values():
+		for writer in alive_connections:
 			writer.write(message)
 
 
 @battle_ensure_consistency
-def battle_push(moment, missiles, width, height, connections):
+def battle_push(moment, missiles, width, height, alive_connections):
 	for missile in missiles.copy().values():
 		gap = moment - missile.future_moment
 		if gap < 0:
@@ -428,18 +432,18 @@ def battle_push(moment, missiles, width, height, connections):
 			del missiles[missile.id]
 
 			message = client_missile_destroy_template.format(missile=missile).encode('utf-8')
-			for _, writer in connections.values():
+			for writer in alive_connections:
 				writer.write(message)
 			continue
 
 		missiles[missile.id] = missile
 		message = client_missile_position_template.format(missile=missile).encode('utf-8')
-		for _, writer in connections.values():
+		for writer in alive_connections:
 			writer.write(message)
 
 
 @battle_ensure_consistency
-def battle_blow_up(moment, missiles, alive_players, dead_players, connections):
+def battle_blow_up(moment, missiles, alive_players, dead_players, alive_connections):
 	for missile in missiles.copy().values():
 		exploded = []
 		for victim in alive_players.copy().values():
@@ -462,12 +466,12 @@ def battle_blow_up(moment, missiles, alive_players, dead_players, connections):
 				message_player_score = client_player_score_template.format(player=missile_owner).encode('utf-8')
 
 				message = (message_missile_destoy, message_player_die, message_player_score)
-				for _, writer in connections.values():
+				for writer in alive_connections:
 					writer.writelines(message)
 
 
 @battle_ensure_consistency
-def battle_pull_the_trigger(moment, fired, missiles, alive_players, dead_players, connections):
+def battle_pull_the_trigger(moment, fired, missiles, alive_players, dead_players, alive_connections):
 	shoot = False
 	for intention in fired:
 		id, *_ = intention
@@ -477,7 +481,6 @@ def battle_pull_the_trigger(moment, fired, missiles, alive_players, dead_players
 		shoot = True
 
 		player = alive_players[id]
-		delta = STEP_DELTA[player.direction]
 		missile = Missile(
 			id=player.id, x=player.x, y=player.y, direction=player.direction,
 			future_moment=moment+MISSILE_VELOCITY_S,
@@ -485,43 +488,47 @@ def battle_pull_the_trigger(moment, fired, missiles, alive_players, dead_players
 		missiles[id] = missile
 
 		message = client_missile_position_template.format(missile=missile).encode('utf-8')
-		for _, writer in connections.values():
+		for writer in alive_connections:
 			writer.write(message)
 
 	return shoot
 
 
-def battle_recognize(joined, width, height, spawn_delta, alive_players, missiles, dead_players, connections):
+def battle_recognize(joined, width, height, spawn_delta, alive_players, missiles, dead_players, connections, alive_connections):
+	new = []
 	for intention in joined:
 		id, _, color = intention
 		x, y = battle_find_spawn_point(width, height, spawn_delta, alive_players, missiles)
-		writer = connections[id][1]
+		new_writer = connections[id][1]
 		new_player = Player(id, color, x, y, Direction(0), 0, None)
 		alive_players[id] = new_player
 
 		for player in alive_players.values():
 			message = client_joined_template.format(player=player).encode('utf-8')
-			writer.write(message)
+			new_writer.write(message)
 		for player in dead_players.values():
 			message = client_joined_template.format(player=player).encode('utf-8')
-			writer.write(message)
+			new_writer.write(message)
 			message = client_player_die_template.format(player=player).encode('utf-8')
-			writer.write(message)
+			new_writer.write(message)
 		for missile in missiles.values():
 			message = client_missile_position_template.format(missile=missile).encode('utf-8')
-			writer.write(message)
+			new_writer.write(message)
 
 		message = client_id_template.format(player=new_player).encode('utf-8')
-		writer.write(message)
+		new_writer.write(message)
 
 		message = client_joined_template.format(player=new_player).encode('utf-8')
-		for id in connections.keys() - {id,}:
-			writer = connections[id][1]
+		for writer in chain(alive_connections, new):
 			writer.write(message)
+
+		new.append(new_writer)
+
+	return new
 
 
 @battle_ensure_consistency
-def battle_spawn(moment, dead_players, width, height, spawn_delta, alive_players, missiles, connections):
+def battle_spawn(moment, dead_players, width, height, spawn_delta, alive_players, missiles, alive_connections):
 	for player in dead_players.copy().values():
 		if moment < player.future_moment:
 			continue
@@ -532,7 +539,7 @@ def battle_spawn(moment, dead_players, width, height, spawn_delta, alive_players
 		alive_players[player.id] = player
 
 		message = client_player_position_template.replace('\n', ' :spawn \n').format(player=player).encode('utf-8')
-		for _, writer in connections.values():
+		for writer in alive_connections:
 			writer.write(message)
 
 
@@ -571,6 +578,8 @@ def ask_exit(loop, signame):
 
 def main():
 	logging.basicConfig(level=logging.WARNING)
+	if DEBUG:
+		logging.basicConfig(level=logging.DEBUG)
 	loop = asyncio.get_event_loop()
 	loop.set_debug(enabled=DEBUG)
 	for signame in ('SIGINT', 'SIGTERM'):
